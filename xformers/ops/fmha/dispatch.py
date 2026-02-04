@@ -10,7 +10,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import torch
 
-from . import attn_bias, ck, cutlass, flash, flash3, triton_splitk
+from . import attn_bias, ck, cutlass, flash, flash3, mps, triton_splitk
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
@@ -96,11 +96,11 @@ def _dispatch_fw_priority_list(
             ]
         )
     else:
-        priority_list_ops = deque(
-            [
-                ck.FwOp,
-            ]
-        )
+        # Check for MPS (Apple Silicon) or fall back to ck
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            priority_list_ops = deque([mps.FwOp])
+        else:
+            priority_list_ops = deque([ck.FwOp])
     if not needs_gradient:
         mqa_or_gqa = (
             inp.key.ndim > 3 and inp.key.stride(-2) == 0 and inp.key.shape[-2] > 1
@@ -157,9 +157,11 @@ def _dispatch_bw(
         if _get_use_fa3():
             priority_list_ops = [flash3.BwOp] + priority_list_ops
     else:
-        priority_list_ops = [
-            ck.BwOp,
-        ]
+        # Check for MPS (Apple Silicon) or fall back to ck
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            priority_list_ops = [mps.BwOp]
+        else:
+            priority_list_ops = [ck.BwOp]
 
     # NOTE: If we have a variable seqlen `attn_bias`, we need to get a BW pass
     # that supports the LSE format
