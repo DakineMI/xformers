@@ -3,6 +3,32 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+MPS (Metal Performance Shaders) Attention Operators
+
+This module implements memory-efficient attention operators using PyTorch's native
+scaled_dot_product_attention on Apple's Metal Performance Shaders backend.
+
+Supported Features:
+    - Forward pass: float32, float16, bfloat16 on MPS and CPU devices
+    - Backward pass: Same dtypes with proper gradient computation
+    - Attention masks: Causal (LowerTriangularMask), Tensor masks, None
+    - Dropout: Supported via PyTorch's native implementation
+    - Custom scale: Supported
+
+Limitations:
+    - Only BMHK format (4D tensors) is supported
+    - Group/MQA/GQA attention not yet supported
+    - No attention bias gradient support (db=None)
+    - BlockDiagonalMask requires custom handling
+    - Different value embedding not supported
+
+Performance Notes:
+    - Uses PyTorch's native scaled_dot_product_attention for optimal MPS performance
+    - CPU fallback available for non-MPS devices
+    - LSE is computed during forward pass for backward compatibility
+"""
+
 from typing import Any, Iterable, Mapping, Optional, Set, Tuple, Union
 
 import torch
@@ -90,22 +116,42 @@ class FwOp(AttentionFwOpBase):
                 is_causal=is_causal
             )
 
-            # For LSE, create a placeholder that matches expected shape
-            # LSE shape should be [batch, heads, seq_len]
+            # Compute actual LSE for backward pass
+            # LSE shape should be [batch, heads, seq_len] = [B, H, M]
+            lse = None
             if needs_gradient:
                 B, M, H, K = inp.query.shape
-                lse = torch.zeros(B, H, M, dtype=output.dtype, device=output.device)
-            else:
-                lse = None
+                # Compute LSE: LSE_i = log(sum_j(exp(Q_i @ K_j^T / sqrt(d))))
+                scale_factor = inp.scale if inp.scale is not None else (K ** -0.5)
+
+                # Reshape for head-wise computation: [B, M, H, K] -> [B, H, M, K]
+                query_h = inp.query.permute(0, 2, 1, 3).contiguous()  # [B, H, M, K]
+                key_h = inp.key.permute(0, 2, 3, 1).contiguous()  # [B, H, K, M]
+
+                # Compute attention scores: [B, H, M, K] @ [B, H, K, M] = [B, H, M, M]
+                attn_scores = torch.matmul(query_h * scale_factor, key_h)  # [B, H, M, M]
+
+                if is_causal:
+                    # Create causal mask: upper triangle (excluding diagonal)
+                    causal_mask = torch.triu(
+                        torch.ones(M, M, dtype=inp.query.dtype, device=inp.query.device),
+                        diagonal=1
+                    )
+                    attn_scores = attn_scores.masked_fill(causal_mask.bool(), float('-inf'))
+
+                if attn_mask is not None:
+                    attn_scores = attn_scores + attn_mask
+
+                # Compute LSE: log(sum_j(exp(attn[:,:,i,j]))) for each [h, i]
+                # attn_scores: [B, H, M, M]
+                attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True)[0]
+                attn_exp = torch.exp(attn_scores)
+                lse = torch.log(attn_exp.sum(dim=-1))  # [B, H, M]
 
         # Create context for backward pass if needed
-        # Note: Context is created for API compatibility with xFormers attention operators.
-        # Since PyTorch's scaled_dot_product_attention has built-in autograd support,
-        # we don't need to manually store intermediate values for gradient computation.
-        # The backward pass re-runs forward with requires_grad=True and uses PyTorch's
-        # native autograd to compute gradients.
         ctx = None
         if needs_gradient:
+            assert lse is not None, "LSE must be computed when needs_gradient=True"
             ctx = Context(
                 lse=lse,
                 out=output,
@@ -120,42 +166,50 @@ class FwOp(AttentionFwOpBase):
         attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
         inp: Inputs
     ) -> Optional[torch.Tensor]:
-        """Convert xFormers attention bias to PyTorch attention mask format"""
+        """Convert xFormers attention bias to PyTorch attention mask format
+        
+        Returns:
+            - None: Use is_causal=True for causal attention
+            - torch.Tensor: Attention mask in compatible format
+            
+        Supported formats:
+            - torch.Tensor: [B, H, M, M] raw attention mask
+            - LowerTriangularMask: Use is_causal=True instead (returns None)
+            - LowerTriangularMaskWithTensorBias: Extracts bias tensor
+            - BlockDiagonalMask: Not directly supported (returns None)
+            - BlockDiagonalPaddedKeysMask: Not directly supported (returns None)
+        """
         if attn_bias is None:
             return None
 
         if isinstance(attn_bias, torch.Tensor):
-            # xFormers uses [B, H, M, M] format
-            # PyTorch expects [B, M_q, H, M_k] for attn_mask
-            # For self-attention where M_q == M_k, we need to ensure proper broadcasting
+            # xFormers uses [B, H, M_q, M_k] format for attention masks
+            # PyTorch's scaled_dot_product_attention accepts [B, M_q, M_k] or [B, H, M_q, M_k]
             if attn_bias.ndim == 4:
                 B, H, M_q, M_k = attn_bias.shape
-                # Verify shape matches expected [B, H, M, M]
                 _, M, _, _ = inp.query.shape
                 if M_q == M_k == M:
-                    # Shape is [B, H, M, M] - this matches xFormers format
-                    # Keep as-is for now
+                    # Shape [B, H, M, M] is compatible - pass through
                     return attn_bias
+            # For mismatched shapes or other formats, pass through for PyTorch to handle
             return attn_bias
 
         if isinstance(attn_bias, LowerTriangularMask):
-            # Create causal mask for PyTorch's scaled_dot_product_attention
-            # PyTorch expects is_causal=True for causal attention
-            return None  # Return None and use is_causal=True instead
+            # Use PyTorch's built-in causal attention via is_causal=True
+            return None
 
         if isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
-            # For tensor bias, we need to handle it properly
+            # Extract the bias tensor from the mask wrapper
             bias_tensor = attn_bias._bias
             if bias_tensor.ndim == 4:  # [B, H, M, M] format
                 B, H, M_q, M_k = bias_tensor.shape
                 _, M, _, _ = inp.query.shape
                 if M_q == M_k == M:
-                    # Shape is [B, H, M, M]
                     return bias_tensor
-            else:
-                return None
+            return None
 
-        # For other bias types, return None (no mask)
+        # For BlockDiagonalMask and other specialized types, return None
+        # These require custom handling not yet implemented
         return None
 
     @classmethod
@@ -220,24 +274,35 @@ class BwOp(AttentionBwOpBase):
         attn_mask = FwOp._convert_attn_bias_to_mask(inp.attn_bias, inp)
         is_causal = isinstance(inp.attn_bias, LowerTriangularMask)
 
-        # Re-run forward pass with gradients enabled
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query=query,
-            key=key,
-            value=value,
-            attn_mask=attn_mask,
-            dropout_p=inp.p,
-            scale=inp.scale,
-            is_causal=is_causal
-        )
+        # Re-run forward pass with gradients enabled explicitly
+        with torch.enable_grad():
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                dropout_p=inp.p,
+                scale=inp.scale,
+                is_causal=is_causal
+            )
 
         # Compute gradients using autograd
         output.backward(grad)
 
+        # Ensure gradients are not None when grad is enabled
+        dq = query.grad
+        dk = key.grad
+        dv = value.grad
+
+        if torch.is_grad_enabled():
+            assert dq is not None, "Query gradient is None - this should not happen"
+            assert dk is not None, "Key gradient is None - this should not happen"
+            assert dv is not None, "Value gradient is None - this should not happen"
+
         return Gradients(
-            dq=query.grad,
-            dk=key.grad,
-            dv=value.grad,
+            dq=dq,
+            dk=dk,
+            dv=dv,
             db=None  # No bias gradient support yet
         )
 

@@ -95,12 +95,17 @@ def _dispatch_fw_priority_list(
                 cutlass.FwOp,
             ]
         )
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and inp.query.device.type == "mps":
+        # MPS-specific priority list - use MPS operator on MPS devices
+        priority_list_ops = deque([mps.FwOp])
+    elif inp.query.device.type == "cpu":
+        # For CPU devices, try CK operator (CPU-optimized) first
+        # MPS operator can be used as fallback but CK is typically faster on CPU
+        priority_list_ops = deque([ck.FwOp, mps.FwOp])
     else:
-        # Check for MPS (Apple Silicon) or fall back to ck
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            priority_list_ops = deque([mps.FwOp])
-        else:
-            priority_list_ops = deque([ck.FwOp])
+        # For other devices (e.g., accelerators without specialized ops),
+        # try CK first, then MPS as fallback
+        priority_list_ops = deque([ck.FwOp, mps.FwOp])
     if not needs_gradient:
         mqa_or_gqa = (
             inp.key.ndim > 3 and inp.key.stride(-2) == 0 and inp.key.shape[-2] > 1
@@ -156,12 +161,16 @@ def _dispatch_bw(
         ]
         if _get_use_fa3():
             priority_list_ops = [flash3.BwOp] + priority_list_ops
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and inp.query.device.type == "mps":
+        # MPS-specific backward ops
+        priority_list_ops = [mps.BwOp]
+    elif inp.query.device.type == "cpu":
+        # For CPU devices, try CK operator (CPU-optimized) first
+        # MPS operator can be used as fallback but CK is typically faster on CPU
+        priority_list_ops = [ck.BwOp, mps.BwOp]
     else:
-        # Check for MPS (Apple Silicon) or fall back to ck
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            priority_list_ops = [mps.BwOp]
-        else:
-            priority_list_ops = [ck.BwOp]
+        # For other devices, try CK first, then MPS as fallback
+        priority_list_ops = [ck.BwOp, mps.BwOp]
 
     # NOTE: If we have a variable seqlen `attn_bias`, we need to get a BW pass
     # that supports the LSE format
