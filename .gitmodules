@@ -8,3 +8,6 @@
 	path = third_party/composable_kernel_tiled
 	url = https://github.com/ROCm/composable_kernel.git
 	branch = develop
+[submodule "third_party/sputnik"]
+	path = third_party/sputnik
+	url = https://github.com/google-research/sputnik.git

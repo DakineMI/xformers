@@ -15,6 +15,7 @@ from . import (
     cutlass_blackwell,
     flash,
     flash3,
+    mps,
     triton_splitk,
 )
 from .attn_bias import (
@@ -50,6 +51,7 @@ MemoryEfficientAttentionCutlassFwdFlashBwOp = (cutlass.FwOp, flash.BwOp)
 MemoryEfficientAttentionFlashAttentionOp = (flash.FwOp, flash.BwOp)
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
+MemoryEfficientAttentionMpsOp = (mps.FwOp, mps.BwOp)
 
 
 def _deserialize_bias(attn_bias_ctx, attn_bias_tensor: Optional[torch.Tensor]) -> Any:
@@ -65,6 +67,8 @@ def _deserialize_bias(attn_bias_ctx, attn_bias_tensor: Optional[torch.Tensor]) -
 _OPS_LOOKUP = {
     flash.FwOp.NAME: flash.FwOp,
     flash.BwOp.NAME: flash.BwOp,
+    mps.FwOp.NAME: mps.FwOp,
+    mps.BwOp.NAME: mps.BwOp,
 }
 
 
