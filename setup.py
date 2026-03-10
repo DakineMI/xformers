@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 import platform
-import re
 import shlex
 import shutil
 import subprocess
@@ -29,6 +28,11 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
     ROCM_HOME,
 )
+
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:
+    _bdist_wheel = None
 
 this_dir = os.path.dirname(__file__)
 pt_attn_compat_file_path = os.path.join(
@@ -121,140 +125,6 @@ def get_hip_version(rocm_dir) -> Optional[str]:
     return None
 
 
-######################################
-# FLASH-ATTENTION v3
-######################################
-# Supports `9.0`, `9.0+PTX`, `9.0a+PTX` etc...
-PARSE_CUDA_ARCH_RE = re.compile(
-    r"(?P<major>[0-9]+)\.(?P<minor>[0-9])(?P<suffix>[a-zA-Z]{0,1})(?P<ptx>\+PTX){0,1}"
-)
-
-
-def get_flash_attention3_nvcc_archs_flags(cuda_version: int):
-    if os.getenv("XFORMERS_DISABLE_FLASH_ATTN", "0") != "0":
-        return []
-    if cuda_version < 1203:
-        return []
-    if (
-        sys.platform == "win32" or platform.system() == "Windows"
-    ) and cuda_version >= 1300:
-        return []
-    archs_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    if archs_list is None:
-        if torch.cuda.get_device_capability("cuda") != (
-            9,
-            0,
-        ) and torch.cuda.get_device_capability("cuda") != (8, 0):
-            return []
-        archs_list = "8.0 9.0a"
-    nvcc_archs_flags = []
-    for arch in archs_list.replace(" ", ";").split(";"):
-        match = PARSE_CUDA_ARCH_RE.match(arch)
-        assert match is not None, f"Invalid sm version: {arch}"
-        num = 10 * int(match.group("major")) + int(match.group("minor"))
-        if num not in [80, 90]:  # only support Sm80/Sm90
-            continue
-        suffix = match.group("suffix")
-        nvcc_archs_flags.append(
-            f"-gencode=arch=compute_{num}{suffix},code=sm_{num}{suffix}"
-        )
-        if match.group("ptx") is not None:
-            nvcc_archs_flags.append(
-                f"-gencode=arch=compute_{num}{suffix},code=compute_{num}{suffix}"
-            )
-    return nvcc_archs_flags
-
-
-def get_flash_attention3_extensions(cuda_version: int, extra_compile_args):
-    nvcc_archs_flags = get_flash_attention3_nvcc_archs_flags(cuda_version)
-
-    if not nvcc_archs_flags:
-        return []
-
-    flash_root = os.path.join(this_dir, "third_party", "flash-attention")
-    cutlass_inc = os.path.join(flash_root, "csrc", "cutlass", "include")
-    if not os.path.exists(flash_root) or not os.path.exists(cutlass_inc):
-        raise RuntimeError(
-            "flashattention submodule not found. Did you forget "
-            "to run `git submodule update --init --recursive` ?"
-        )
-
-    sources = [
-        str(Path(f).relative_to(flash_root))
-        for f in glob.glob(os.path.join(flash_root, "hopper", "*.cu"))
-        + glob.glob(os.path.join(flash_root, "hopper", "instantiations", "*.cu"))
-    ]
-    # hdimall and softcapall are .cu files which include all the other .cu files
-    # for explicit values hence causing us to build these kernels twice.
-    sources = [s for s in sources if ("hdimall" not in s and "softcapall" not in s)]
-    # use non-stable API for now
-    sources += [os.path.join("hopper", "flash_api_stable.cpp")]
-
-    # We don't care/expose softcap and fp8 and paged attention,
-    # hence we disable them for faster builds.
-    DISABLED_CAPABILITIES = (
-        # (filename_pattern, compilation_flag)
-        # Not exposed in xFormers
-        ("softcap", "-DFLASHATTENTION_DISABLE_SOFTCAP"),
-        # Not exposed in xFormers
-        ("e4m3", "-DFLASHATTENTION_DISABLE_FP8"),
-        # Enabling paged attention causes segfault with some
-        # versions of nvcc :(
-        # https://github.com/Dao-AILab/flash-attention/issues/1453
-        # ("paged", "-DFLASHATTENTION_DISABLE_PAGEDKV"),
-        # We have `CUDA_MINIMUM_COMPUTE_CAPABILITY` set to 9.0
-        # ("_sm80.cu", "-DFLASHATTENTION_DISABLE_SM8x"),
-    )
-    sources = [
-        s
-        for s in sources
-        if all(disabled_cap[0] not in s for disabled_cap in DISABLED_CAPABILITIES)
-    ]
-    common_extra_compile_args = [x[1] for x in DISABLED_CAPABILITIES]
-
-    return [
-        CUDAExtension(
-            name="xformers.flash_attn_3._C",
-            sources=[os.path.join(flash_root, path) for path in sources],
-            extra_compile_args={
-                "cxx": extra_compile_args.get("cxx", []) + common_extra_compile_args,
-                "nvcc": extra_compile_args.get("nvcc", [])
-                + [
-                    "-O3",
-                    # "-O0",
-                    "-std=c++17",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-                    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math",
-                    # "-lineinfo", # xformers: save binary size
-                    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
-                    "-DNDEBUG",  # Important, otherwise performance is severely impacted
-                    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-                    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-                    "-D_USE_MATH_DEFINES",  # required for M_LOG2E on windows
-                ]
-                + nvcc_archs_flags
-                + common_extra_compile_args
-                + get_extra_nvcc_flags_for_build_type(cuda_version),
-            },
-            include_dirs=[
-                p.absolute()
-                for p in [
-                    Path(flash_root) / "csrc" / "cutlass" / "include",
-                    Path(flash_root) / "hopper",
-                ]
-            ],
-            py_limited_api=True,
-        )
-    ]
-
-
 def rename_cpp_cu(cpp_files):
     for entry in cpp_files:
         shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
@@ -319,12 +189,10 @@ def get_extensions():
 
     define_macros = []
 
-    extra_compile_args = {"cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"]}
+    extra_compile_args = {"cxx": ["-O3", "-std=c++17"]}
     if sys.platform == "win32":
         if os.getenv("DISTUTILS_USE_SDK") == "1":
-            extra_compile_args = {
-                "cxx": ["-O2", "/std:c++17", "/DPy_LIMITED_API=0x03090000"]
-            }
+            extra_compile_args = {"cxx": ["-O2", "/std:c++17"]}
         define_macros += [("xformers_EXPORTS", None)]
         extra_compile_args["cxx"].extend(
             ["/MP", "/Zc:lambda", "/Zc:preprocessor", "/Zc:__cplusplus"]
@@ -369,7 +237,6 @@ def get_extensions():
             "--extended-lambda",
             "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
             "-std=c++17",
-            "-DPy_LIMITED_API=0x03090000",
         ] + get_extra_nvcc_flags_for_build_type(cuda_version)
         if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
             nvcc_flags.append("-DNDEBUG")
@@ -395,15 +262,10 @@ def get_extensions():
         stable_args = [
             "-DTORCH_STABLE_ONLY",
             "-DTORCH_TARGET_VERSION=0x020a000000000000",
-            "-DUSE_CUDA",
         ]
         extra_compile_args["cxx"].extend(stable_args)
-        extra_compile_args["nvcc"].extend(stable_args)
+        extra_compile_args["nvcc"].extend(stable_args + ["-DUSE_CUDA"])
 
-        ext_modules += get_flash_attention3_extensions(cuda_version, extra_compile_args)
-
-        # NOTE: This should not be applied to Flash-Attention
-        # see https://github.com/Dao-AILab/flash-attention/issues/359
         if (
             "--device-debug" not in nvcc_flags and "-G" not in nvcc_flags
         ):  # (incompatible with -G)
@@ -476,7 +338,6 @@ def get_extensions():
             include_dirs=[os.path.abspath(p) for p in include_dirs],
             define_macros=define_macros,
             extra_compile_args=extra_compile_args,
-            py_limited_api=True,
         )
     )
 
@@ -517,38 +378,41 @@ class clean(distutils.command.clean.clean):  # type: ignore
         distutils.command.clean.clean.run(self)
 
 
+class bdist_wheel_abi_none(_bdist_wheel if _bdist_wheel else object):
+    """
+    Custom wheel builder that tags wheels as ABI-independent despite containing compiled code.
+    The compiled extensions are plain shared libraries (.so/.dll) that use only PyTorch's
+    TORCH_LIBRARY mechanism, with no Python C API dependencies. This allows the same wheel
+    to work across different Python versions and variants (including free-threaded builds).
+    """
+
+    def get_tag(self):
+        if _bdist_wheel is None:
+            raise RuntimeError("wheel package is required to build wheels")
+
+        # Get the default tags from parent class
+        python_tag, abi_tag, plat_tag = super().get_tag()
+
+        # Override ABI tag to 'none' since our .so files have no Python ABI dependency
+        # Use 'py39' as python tag to indicate minimum Python version (3.9+)
+        # Keep platform tag since we have platform-specific compiled code
+        return "py39", "none", plat_tag
+
+
 class BuildExtensionWithExtraFiles(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         self.xformers_build_metadata = kwargs.pop("extra_files")
         self.pkg_name = "xformers"
         super().__init__(*args, **kwargs)
 
+    def get_export_symbols(self, ext):
+        # Don't export PyInit_* symbols since our extension doesn't use the
+        # Python C API. It registers operators with PyTorch via
+        # STABLE_TORCH_LIBRARY_FRAGMENT and is loaded via torch.ops.load_library().
+        return []
+
     def build_extensions(self) -> None:
         super().build_extensions()
-
-        # Fix incorrect output names caused by py_limited_api=True on Windows. see item #1272
-        for ext in self.extensions:
-            ext_path_parts = ext.name.split(".")
-            ext_basename = ext_path_parts[-1]
-            ext_subpath = os.path.join(
-                *ext_path_parts[:-1]
-            )  # xformers, xformers/flash_attn_3, etc.
-
-            # Directory where the .pyd was written
-            output_dir = os.path.join(self.build_lib, ext_subpath)
-
-            # Expected correct filename
-            correct_name = os.path.join(output_dir, f"{ext_basename}.pyd")
-
-            # But py_limited_api may incorrectly write it as just "pyd"
-            broken_name = os.path.join(output_dir, "pyd")
-            if os.path.exists(broken_name) and not os.path.exists(correct_name):
-                import shutil
-
-                print(
-                    f"[INFO]build_extensions: Fixing broken .pyd name: {broken_name} -> {correct_name}"
-                )
-                shutil.move(broken_name, correct_name)
 
         for filename, content in self.xformers_build_metadata.items():
             with open(
@@ -564,23 +428,6 @@ class BuildExtensionWithExtraFiles(BuildExtension):
         build_py = self.get_finalized_command("build_py")
         package_dir = build_py.get_package_dir(self.pkg_name)
 
-        # Fix for windows when using py_limited_api=True. see #1272
-        for ext in self.extensions:
-            ext_path_parts = ext.name.split(".")
-            ext_basename = ext_path_parts[-1]
-            ext_subpath = os.path.join(*ext_path_parts[:-1])
-            build_dir = os.path.join(self.build_lib, ext_subpath)
-
-            correct_name = os.path.join(build_dir, f"{ext_basename}.pyd")
-            broken_name = os.path.join(build_dir, "pyd")
-            if os.path.exists(broken_name) and not os.path.exists(correct_name):
-                import shutil
-
-                print(
-                    f"[INFO]copy_extensions_to_source: Fixing inplace broken .pyd name: {broken_name} -> {correct_name}"
-                )
-                shutil.move(broken_name, correct_name)
-
         for filename in self.xformers_build_metadata.keys():
             inplace_file = os.path.join(package_dir, filename)
             regular_file = os.path.join(self.build_lib, self.pkg_name, filename)
@@ -588,21 +435,20 @@ class BuildExtensionWithExtraFiles(BuildExtension):
         super().copy_extensions_to_source()
 
     def get_ext_filename(self, ext_name):
-        filename = super().get_ext_filename(ext_name)
-        # Fix for windows when using py_limited_api=True. see #1272
-        # If setuptools returns a bogus 'pyd' filename, fix it.
-        if os.path.basename(filename) == "pyd":
-            # Extract the final component of the ext_name (after last dot)
-            last_part = ext_name.rsplit(".", 1)[-1]
-            parent_path = (
-                os.path.join(*ext_name.split(".")[:-1]) if "." in ext_name else ""
-            )
-            fixed_name = f"{last_part}.pyd"
-            print(
-                f"[INFO]get_ext_filename: Fixing inplace broken .pyd name: pyd -> {fixed_name}"
-            )
-            return os.path.join(parent_path, fixed_name) if parent_path else fixed_name
-        return filename
+        # Return plain .so/.pyd names without Python version tags
+        # This creates ABI-independent binaries that work with any Python version
+        ext_path = ext_name.split(".")
+        ext_basename = ext_path[-1]
+        ext_dir = os.path.join(*ext_path[:-1]) if len(ext_path) > 1 else ""
+
+        if sys.platform == "win32":
+            # Windows: use .pyd extension (required for importlib to find it)
+            filename = f"{ext_basename}.pyd"
+        else:
+            # Linux/Mac: use plain .so extension
+            filename = f"{ext_basename}.so"
+
+        return os.path.join(ext_dir, filename) if ext_dir else filename
 
 
 if __name__ == "__main__":
@@ -630,6 +476,7 @@ if __name__ == "__main__":
                     "version.py": generate_version_py(version),
                 },
             ),
+            "bdist_wheel": bdist_wheel_abi_none,
             "clean": clean,
         },
         url="https://facebookresearch.github.io/xformers/",
@@ -648,5 +495,4 @@ if __name__ == "__main__":
             "Operating System :: OS Independent",
         ],
         zip_safe=False,
-        options={"bdist_wheel": {"py_limited_api": "cp39"}},
     )
